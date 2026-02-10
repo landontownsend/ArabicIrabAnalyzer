@@ -16,7 +16,42 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+#######
+with open("streamlit_app.py", "r", encoding="utf-8") as f:
+    content = f.read()
 
+# Add download call right after imports, before anything else runs
+old = "@st.cache_resource
+def load_analyzer():"
+
+new = """# Download CAMeL Tools data if not present (needed for Streamlit Cloud)
+@st.cache_resource
+def download_camel_data():
+    try:
+        import subprocess, sys
+        subprocess.run(
+            [sys.executable, "-m", "camel_tools.data", "download", "-y", "morphology-db-msa-r13"],
+            check=False,
+            capture_output=True
+        )
+    except Exception:
+        pass
+
+download_camel_data()
+
+@st.cache_resource
+def load_analyzer():
+"""
+
+content = content.replace(old, new)
+
+with open("streamlit_app.py", "w", encoding="utf-8") as f:
+    f.write(content)
+
+print("✓ streamlit_app.py updated with data download step")
+
+
+######
 st.markdown("""
 <style>
     .stTextArea textarea {
