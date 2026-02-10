@@ -190,7 +190,6 @@ I'rab is the formal practice of identifying and explaining these endings and rol
 
 Free to use, modify, and build on.
 
-# Contact
+## Contact
 
-landon20@umd.edu
-landontownsend20@gmail.com
+landon20@umd.edu | landontownsend20@gmail.com
