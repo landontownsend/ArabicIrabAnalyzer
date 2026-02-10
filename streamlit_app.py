@@ -2,56 +2,24 @@ import streamlit as st
 import os
 import json
 import time
+import subprocess
+import sys
 import pandas as pd
 from typing import List, Dict
 from dotenv import load_dotenv
 from camel_tools.tokenizers.word import simple_word_tokenize
 from camel_tools.morphology.database import MorphologyDB
 from camel_tools.morphology.analyzer import Analyzer
-import google.generativeai as genai
+from google import genai
 
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Arabic Irab Analyzer",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-#######
-with open("streamlit_app.py", "r", encoding="utf-8") as f:
-    content = f.read()
 
-# Add download call right after imports, before anything else runs
-old = "@st.cache_resource
-def load_analyzer():"
-
-new = """# Download CAMeL Tools data if not present (needed for Streamlit Cloud)
-@st.cache_resource
-def download_camel_data():
-    try:
-        import subprocess, sys
-        subprocess.run(
-            [sys.executable, "-m", "camel_tools.data", "download", "-y", "morphology-db-msa-r13"],
-            check=False,
-            capture_output=True
-        )
-    except Exception:
-        pass
-
-download_camel_data()
-
-@st.cache_resource
-def load_analyzer():
-"""
-
-content = content.replace(old, new)
-
-with open("streamlit_app.py", "w", encoding="utf-8") as f:
-    f.write(content)
-
-print("✓ streamlit_app.py updated with data download step")
-
-
-######
 st.markdown("""
 <style>
     .stTextArea textarea {
@@ -62,6 +30,21 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ── Download CAMeL Tools data (required for Streamlit Cloud) ──────────────────
+@st.cache_resource
+def download_camel_data():
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "camel_tools.data", "download", "-y", "morphology-db-msa-r13"],
+            check=False,
+            capture_output=True
+        )
+    except Exception:
+        pass
+
+download_camel_data()
+
+# ── Load resources ────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_analyzer():
     db = MorphologyDB.builtin_db()
@@ -74,9 +57,10 @@ def load_gemini_client():
     if not api_key:
         st.error("GEMINI_API_KEY not found. Add it to .env locally or Streamlit Secrets for deployment.")
         st.stop()
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.0-flash")
+    client = genai.Client(api_key=api_key)
+    return client
 
+# ── Core functions ────────────────────────────────────────────────────────────
 def tokenize_arabic(text):
     tokens = simple_word_tokenize(text)
     return [t for t in tokens if t.strip() and not all(c in ".,!?;:،؛" for c in t)]
@@ -124,7 +108,6 @@ def create_prompt(sentence, morphology_data):
         orig  = w["original"]
         lines.append("- " + orig + " : POS=" + pos + ", lemma=" + lemma)
     morph_hints = "\n".join(lines)
-
     return (
         SYSTEM_PROMPT + "\n\n"
         "Sentence: " + sentence + "\n\n"
@@ -137,7 +120,10 @@ def get_irab(sentence, morphology_data, client):
     prompt = create_prompt(sentence, morphology_data)
     for attempt in range(3):
         try:
-            response = client.generate_content(prompt)
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt
+            )
             text = response.text.strip()
             if text.startswith("```json"):
                 text = text.split("```json")[1].split("```")[0].strip()
