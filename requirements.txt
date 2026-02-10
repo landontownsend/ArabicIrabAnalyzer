@@ -1,5 +1,5 @@
 streamlit>=1.32.0
-camel-tools>=1.5.2
 google-genai>=1.0.0
+pyarabic>=0.6.15
 pandas>=2.0.0
 python-dotenv>=1.0.0

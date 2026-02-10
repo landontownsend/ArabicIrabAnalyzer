@@ -2,15 +2,10 @@ import streamlit as st
 import os
 import json
 import time
-import subprocess
-import sys
 import pandas as pd
-from typing import List, Dict
 from dotenv import load_dotenv
-from camel_tools.tokenizers.word import simple_word_tokenize
-from camel_tools.morphology.database import MorphologyDB
-from camel_tools.morphology.analyzer import Analyzer
 from google import genai
+import pyarabic.araby as araby
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -30,94 +25,99 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Download CAMeL Tools data (required for Streamlit Cloud) ──────────────────
-@st.cache_resource
-def download_camel_data():
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "camel_tools.data", "download", "-y", "morphology-db-msa-r13"],
-            check=False,
-            capture_output=True
-        )
-    except Exception:
-        pass
-
-download_camel_data()
-
-# ── Load resources ────────────────────────────────────────────────────────────
-@st.cache_resource
-def load_analyzer():
-    db = MorphologyDB.builtin_db()
-    return Analyzer(db)
-
+# ── Load Gemini ───────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_gemini_client():
     load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        st.error("GEMINI_API_KEY not found. Add it to .env locally or Streamlit Secrets for deployment.")
+        st.error("GEMINI_API_KEY not found.")
         st.stop()
-    client = genai.Client(api_key=api_key)
-    return client
+    return genai.Client(api_key=api_key)
 
-# ── Core functions ────────────────────────────────────────────────────────────
-def tokenize_arabic(text):
-    tokens = simple_word_tokenize(text)
-    return [t for t in tokens if t.strip() and not all(c in ".,!?;:،؛" for c in t)]
+# ── PyArabic Preprocessing ────────────────────────────────────────────────────
+def preprocess_arabic(sentence):
+    """
+    Extract rich linguistic features from Arabic text using PyArabic.
+    These features are passed as structured context to Gemini.
+    """
+    tokens = araby.tokenize(sentence)
+    word_features = []
 
-def analyze_word_morphology(word, analyzer, max_analyses=1):
-    analyses = analyzer.analyze(word)
-    results = []
-    for analysis in analyses[:max_analyses]:
-        results.append({
-            "word"    : word,
-            "diac"    : analysis.get("diac", word),
-            "lex"     : analysis.get("lex",  ""),
-            "pos"     : analysis.get("pos",  ""),
-            "gloss"   : analysis.get("gloss",""),
-            "features": {
-                "gender": analysis.get("gen", ""),
-                "number": analysis.get("num", ""),
-                "person": analysis.get("per", ""),
-                "case"  : analysis.get("cas", ""),
-                "state" : analysis.get("stt", ""),
-            }
+    for token in tokens:
+        # Strip diacritics for base form
+        stripped     = araby.strip_tashkeel(token)
+        # Remove only last haraka (useful for case detection)
+        no_last      = araby.strip_lastharaka(token)
+        # Normalize letter variants (alef, hamza, etc.)
+        normalized   = araby.normalize_ligature(araby.normalize_hamza(stripped))
+        # Detect definite article
+        has_al       = araby.has_alef_lam(stripped) if hasattr(araby, 'has_alef_lam') else stripped.startswith(araby.ALEF + araby.LAM)
+        # Sun/moon letter detection for words with ال
+        is_sun       = False
+        if has_al and len(stripped) > 2:
+            is_sun = araby.is_sun(stripped[2])
+        # Check if pure Arabic
+        is_arabic    = araby.is_arabicrange(token[0]) if token else False
+
+        word_features.append({
+            "token"     : token,
+            "stripped"  : stripped,
+            "normalized": normalized,
+            "no_last"   : no_last,
+            "has_al"    : has_al,
+            "is_sun"    : is_sun,
+            "is_arabic" : is_arabic,
         })
-    return results
 
-def analyze_sentence(sentence, analyzer):
-    tokens = tokenize_arabic(sentence)
-    return [
-        {"original": token, "morphology": analyze_word_morphology(token, analyzer)}
-        for token in tokens
-    ]
+    return word_features
 
-SYSTEM_PROMPT = """أنت خبير في النحو العربي والإعراب.
-You are an expert in Arabic grammar and irab. For each word provide:
-1. الإعراب (grammatical role)
-2. علامة الإعراب (grammatical marker)
-3. التفاصيل (gender, number, definiteness)
-4. A brief English explanation
-Return a JSON array only, no extra text."""
-
-def create_prompt(sentence, morphology_data):
+def format_features_for_prompt(word_features):
+    """
+    Format PyArabic features into a readable string for the Gemini prompt.
+    """
     lines = []
-    for w in morphology_data:
-        pos   = w["morphology"][0]["pos"] if w["morphology"] else "?"
-        lemma = w["morphology"][0]["lex"] if w["morphology"] else "?"
-        orig  = w["original"]
-        lines.append("- " + orig + " : POS=" + pos + ", lemma=" + lemma)
-    morph_hints = "\n".join(lines)
+    for f in word_features:
+        al_info = ""
+        if f["has_al"]:
+            al_info = " | has ال (definite)" + (" + sun letter assimilation" if f["is_sun"] else " + moon letter")
+        lines.append(
+            "- " + f["token"] +
+            " | base: "       + f["stripped"] +
+            " | normalized: " + f["normalized"] +
+            al_info
+        )
+    return "\n".join(lines)
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """أنت خبير في النحو العربي والإعراب.
+You are an expert in Arabic grammar and irab (grammatical analysis).
+
+You will be given an Arabic sentence along with preprocessed linguistic features
+extracted by PyArabic (tokenization, normalization, definite article detection,
+sun/moon letter classification). Use these features as additional context.
+
+For each word provide:
+1. الإعراب   — grammatical role (فاعل، مفعول به، مبتدأ، خبر، فعل ماض، حرف جر، etc.)
+2. العلامة   — grammatical marker (مرفوع بالضمة، منصوب بالفتحة، مجرور بالكسرة، مبني، etc.)
+3. التفاصيل  — details (definiteness, gender, number, verb tense, etc.)
+4. explanation — one clear sentence in English
+
+Return ONLY a valid JSON array, no markdown, no text outside the array."""
+
+def create_prompt(sentence, word_features):
+    features_str = format_features_for_prompt(word_features)
     return (
-        SYSTEM_PROMPT + "\n\n"
-        "Sentence: " + sentence + "\n\n"
-        "Morphology hints:\n" + morph_hints + "\n\n"
-        "Return ONLY a JSON array:\n"
-        "[{\"word\":\"...\",\"irab\":\"...\",\"sign\":\"...\",\"details\":\"...\",\"explanation\":\"...\"}]"
+        SYSTEM_PROMPT
+        + "\n\nSentence: " + sentence
+        + "\n\nPyArabic linguistic features:\n" + features_str
+        + "\n\nReturn ONLY a JSON array:\n"
+        + "[{\"word\":\"...\",\"irab\":\"...\",\"sign\":\"...\",\"details\":\"...\",\"explanation\":\"...\"}]"
     )
 
-def get_irab(sentence, morphology_data, client):
-    prompt = create_prompt(sentence, morphology_data)
+# ── Analysis ──────────────────────────────────────────────────────────────────
+def get_irab(sentence, word_features, client):
+    prompt = create_prompt(sentence, word_features)
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -130,11 +130,13 @@ def get_irab(sentence, morphology_data, client):
             elif text.startswith("```"):
                 text = text.split("```")[1].split("```")[0].strip()
             return {"success": True, "data": json.loads(text)}
+        except json.JSONDecodeError:
+            return {"success": False, "error": "Could not parse Gemini response. Try again."}
         except Exception as e:
             err = str(e)
             if "429" in err:
                 if "PerDay" in err:
-                    return {"success": False, "error": "Daily quota reached. Try again tomorrow or check billing."}
+                    return {"success": False, "error": "Daily quota reached. Try again tomorrow."}
                 time.sleep(60 * (attempt + 1))
             else:
                 return {"success": False, "error": err}
@@ -142,18 +144,18 @@ def get_irab(sentence, morphology_data, client):
 
 @st.cache_data(show_spinner=False)
 def run_full_analysis(sentence):
-    analyzer = load_analyzer()
-    client   = load_gemini_client()
-    morphology = analyze_sentence(sentence, analyzer)
-    irab_resp  = get_irab(sentence, morphology, client)
+    client        = load_gemini_client()
+    word_features = preprocess_arabic(sentence)
+    irab_resp     = get_irab(sentence, word_features, client)
     return {
-        "original"  : sentence,
-        "morphology": morphology,
-        "irab"      : irab_resp.get("data", []),
-        "success"   : irab_resp["success"],
-        "error"     : irab_resp.get("error")
+        "original"    : sentence,
+        "word_features": word_features,
+        "irab"        : irab_resp.get("data", []),
+        "success"     : irab_resp["success"],
+        "error"       : irab_resp.get("error")
     }
 
+# ── UI Helpers ────────────────────────────────────────────────────────────────
 def get_color(irab_type):
     colors = {
         "فاعل"      : "#2e7d32",
@@ -180,8 +182,9 @@ def word_card(word_data):
     details     = word_data.get("details", "")
     explanation = word_data.get("explanation", "")
     return (
-        "<div style=\"background:#fff;border-right:6px solid " + color + ";border-radius:10px;"
-        "padding:16px 20px;margin:10px 0;box-shadow:0 2px 6px rgba(0,0,0,0.08);direction:rtl;\">"
+        "<div style=\"background:#fff;border-right:6px solid " + color + ";"
+        "border-radius:10px;padding:16px 20px;margin:10px 0;"
+        "box-shadow:0 2px 6px rgba(0,0,0,0.08);direction:rtl;\">"
         "<div style=\"font-size:26px;font-weight:bold;color:" + color + ";margin-bottom:8px;\">" + word + "</div>"
         "<p style=\"margin:4px 0\"><strong>الإعراب:</strong> " + irab + "</p>"
         "<p style=\"margin:4px 0\"><strong>العلامة:</strong> " + sign + "</p>"
@@ -200,9 +203,10 @@ def render_sidebar():
         Paste any Arabic sentence — voweled or unvoweled —
         and get a full grammatical breakdown of every word.
 
-        **Powered by:**
-        - CAMeL Tools (morphology)
-        - Gemini 2.0 Flash (irab analysis)
+        **Pipeline:**
+        - PyArabic → tokenization, normalization,
+          definite article & sun/moon letter detection
+        - Gemini 2.0 Flash → full irab analysis
         """)
         st.markdown("---")
         st.markdown("### أمثلة — Try an example")
@@ -213,13 +217,14 @@ def render_sidebar():
             "جاء الرجل من السوق",
             "إن الله غفور رحيم",
             "تفتح الأزهار في الربيع",
+            "كان الطقس جميلاً في الصباح",
         ]
         for ex in examples:
-            key = "ex_" + ex
-            if st.button(ex, key=key, use_container_width=True):
+            if st.button(ex, key="ex_" + ex, use_container_width=True):
                 st.session_state.input_text = ex
                 st.rerun()
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     render_sidebar()
 
@@ -254,7 +259,7 @@ def main():
 
             tab1, tab2, tab3 = st.tabs([
                 "📊 الإعراب | Irab",
-                "🔤 الصرف | Morphology",
+                "🔬 Preprocessing | المعالجة",
                 "📝 Raw Data"
             ])
 
@@ -269,29 +274,33 @@ def main():
                         "التفاصيل"   : w.get("details", ""),
                         "Explanation": w.get("explanation", "")
                     })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True
+                )
                 st.markdown("---")
                 st.markdown("#### تفصيل كل كلمة")
                 for w in result["irab"]:
                     st.markdown(word_card(w), unsafe_allow_html=True)
 
             with tab2:
-                st.markdown("#### التحليل الصرفي")
-                for word_data in result["morphology"]:
-                    if word_data["morphology"]:
-                        m        = word_data["morphology"][0]
-                        original = word_data["original"]
-                        diac     = m.get("diac", "N/A")
-                        label    = original + " ← " + diac
-                        with st.expander(label):
-                            st.write("**Lemma:** "  + m.get("lex",   "N/A"))
-                            st.write("**POS:** "    + m.get("pos",   "N/A"))
-                            st.write("**Gloss:** "  + m.get("gloss", "N/A"))
-                            feats = {k: v for k, v in m.get("features", {}).items() if v}
-                            if feats:
-                                st.write("**Features:**")
-                                for k, v in feats.items():
-                                    st.write("  - " + k + ": " + v)
+                st.markdown("#### PyArabic Preprocessing Features")
+                st.markdown("These features were extracted before sending to Gemini:")
+                pre_rows = []
+                for f in result["word_features"]:
+                    pre_rows.append({
+                        "Token"      : f["token"],
+                        "Base Form"  : f["stripped"],
+                        "Normalized" : f["normalized"],
+                        "Definite ال": "✓" if f["has_al"] else "",
+                        "Sun Letter" : "✓" if f["is_sun"] else "",
+                    })
+                st.dataframe(
+                    pd.DataFrame(pre_rows),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
             with tab3:
                 st.json(result)
@@ -305,7 +314,7 @@ def main():
     st.markdown("---")
     st.markdown(
         "<div style=\"text-align:center;color:#aaa;font-size:13px;\">"
-        "Built with CAMeL Tools + Gemini API · Powered by Streamlit"
+        "Built with PyArabic + Gemini 2.0 Flash · Powered by Streamlit"
         "</div>",
         unsafe_allow_html=True
     )
