@@ -188,4 +188,9 @@ I'rab is the formal practice of identifying and explaining these endings and rol
 
 ## License
 
-MIT — free to use, modify, and build on.
+Free to use, modify, and build on.
+
+# Contact
+
+landon20@umd.edu
+landontownsend20@gmail.com
